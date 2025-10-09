@@ -214,7 +214,7 @@ void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
     float Metallic = MetallicTexture.SampleLevel(PointClampSampler, BufferUV, 0).r;
     float3 CameraDirection = normalize(InScreenVector);
 
-    //RedPixel Optimization
+    //RedPixel Optimization FAULTY
     // Precompute constants once per thread
     /*const float2 DispatchXY = (float2)DispatchThreadID.xy;
     const float2 InvViewSize = View.ViewSizeAndInvSize.zw;
