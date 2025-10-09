@@ -120,9 +120,17 @@ void DDGIProbeBlendingCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Grou
         if (probeRRIndex >= ProbeIndexStart + ProbeIndexCount)
             exitEarly = true;*/
         //RedPixel Optimization
-        int numProbes = DDGIVolume.probeGridCounts.x * DDGIVolume.probeGridCounts.y * DDGIVolume.probeGridCounts.z;
-        int probeRRIndex = probeIndex + ((probeIndex < ProbeIndexStart) ? numProbes : 0);
-        exitEarly = (probeRRIndex >= (ProbeIndexStart + ProbeIndexCount));
+        const int numProbes = DDGIVolume.probeGridCounts.x * DDGIVolume.probeGridCounts.y * DDGIVolume.probeGridCounts.z;
+        /*int probeRRIndex = probeIndex + ((probeIndex < ProbeIndexStart) ? numProbes : 0);
+        exitEarly = (probeRRIndex >= (ProbeIndexStart + ProbeIndexCount));*/
+        //Optimized by RedPixel
+        int rr = probeIndex - ProbeIndexStart;
+        // Branchless wrap: add numProbes if rr < 0
+        // (portable form: use logical shift on uint)
+        const uint wrap = (asuint(rr) >> 31);     // 1 if rr < 0, else 0
+        rr += int(wrap) * numProbes;
+        // Early exit if outside [0, ProbeIndexCount)
+        exitEarly = (rr >= ProbeIndexCount);
     }
 #endif
 
@@ -304,25 +312,36 @@ void DDGIProbeBlendingCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Grou
     #else // !RTXGI_DDGI_BLEND_RADIANCE
 
         // Initialize the probe hit distance to three quarters of the distance of the grid cell diagonal
-        float probeMaxRayDistance = length(DDGIVolume.probeGridSpacing) * 1.5f;
+        /*float probeMaxRayDistance = length(DDGIVolume.probeGridSpacing) * 1.5f;
 
         // Increase or decrease the filtered distance value's "sharpness"
-        weight = pow(weight, DDGIVolume.probeDistanceExponent);
+        weight = pow(weight, DDGIVolume.probeDistanceExponent);*/
+        //Optimized by RedPixel
+        const float probeMaxRayDistance = 1.5f * length(DDGIVolume.probeGridSpacing);   // keep exact behavior
+        // (If this code is inside a per-ray loop, hoist the line above *outside* the loop.)
 
+        // Distance weight shaping (skip pow when exponent is exactly 1)
+        if (DDGIVolume.probeDistanceExponent != 1.0f)
+        {
+            weight = pow(weight, DDGIVolume.probeDistanceExponent);
+        }
+        
         // Load the ray traced distance
+        float probeRayDistance;
         #if RTXGI_DDGI_SHARED_MEMORY
-            float probeRayDistance = min(abs(RayDistance[rayIndex]), probeMaxRayDistance);
+        probeRayDistance = min(abs(RayDistance[rayIndex]), probeMaxRayDistance);
         #else
             // HitT is negative on backface hits for the probe relocation, take the absolute value
             #if (RTXGI_DDGI_FORMAT_RADIANCE == 1)
-                float probeRayDistance = min(abs(DDGIVolumeRayDataUAV[probeRayIndex].a), probeMaxRayDistance);
+                probeRayDistance = min(abs(DDGIVolumeRayDataUAV[probeRayIndex].a), probeMaxRayDistance);
             #else
-                float probeRayDistance = min(abs(DDGIVolumeRayDataUAV[probeRayIndex].g), probeMaxRayDistance);
+                probeRayDistance = min(abs(DDGIVolumeRayDataUAV[probeRayIndex].g), probeMaxRayDistance);
             #endif
         #endif
 
         // Filter the ray distance
-        result += float4(probeRayDistance * weight, (probeRayDistance * probeRayDistance) * weight, 0.f, weight);
+        const float t = weight * probeRayDistance;
+        result += float4(t, t * probeRayDistance, 0.0f, weight);
     #endif
     }
 
@@ -330,9 +349,18 @@ void DDGIProbeBlendingCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Grou
     // To match the Monte Carlo Estimator for Irradiance, we should divide by N. Instead, we are dividing by
     // N * sum(cos(theta)) (the sum of the weights) to reduce variance.
     // To account for this, we must mulitply in a factor of 1/2.
-    const float epsilon = 1e-9f * float(DDGIVolume.numRaysPerProbe);
-    result.rgb *= 1.f / max(2.f * result.a, epsilon);
+    /*OG
+     const float epsilon = 1e-9f * float(DDGIVolume.numRaysPerProbe);
+    result.rgb *= 1.f / max(2.f * result.a, epsilon);*/
+    //Optimized by red pixel
+    // Filter/accumulate distance: reuse multiplies (t = weight * distance)
+    
 
+    // --- After loop: normalization (unchanged math, faster form) ---
+    const float epsilon = 1e-9f * float(DDGIVolume.numRaysPerProbe);
+    const float invDen  = rcp(max(2.0f * result.a, epsilon));   // 1 / max(2*sum(weights), eps)
+    result.rgb *= invDen;
+    
     float  hysteresis = DDGIVolume.probeHysteresis;
     float3 previous = DDGIVolumeProbeDataUAV[probeTexCoords].rgb;
 
@@ -357,7 +385,8 @@ void DDGIProbeBlendingCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Grou
     if (probeSpace.x == prevProbeSpace.x && probeSpace.y == prevProbeSpace.y && probeSpace.z == prevProbeSpace.z)
     {
 #endif
-        if (RTXGIMaxComponent(previous.rgb - result.rgb) > DDGIVolume.probeChangeThreshold)
+        /* OG
+         if (RTXGIMaxComponent(previous.rgb - result.rgb) > DDGIVolume.probeChangeThreshold)
         {
             // Lower the hysteresis when a large lighting change is detected
             hysteresis = max(0.f, hysteresis - 0.75f);
@@ -385,7 +414,47 @@ void DDGIProbeBlendingCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Grou
         {
             lerpDelta = min(max(c_threshold, abs(lerpDelta)), abs(delta)) * sign(lerpDelta);
         }
-        result = float4(previous.rgb + lerpDelta, 1.f);
+        result = float4(previous.rgb + lerpDelta, 1.f);*/
+        //Optimized by RedPixel
+        {
+            const float dMax = RTXGIMaxComponent(previous.rgb - result.rgb);
+            const float changeMask = (dMax > DDGIVolume.probeChangeThreshold) ? 1.0f : 0.0f;
+            hysteresis = max(0.0f, hysteresis - (0.75f * changeMask));
+        }
+
+        // --- Brightness clamp (use squared length; mathematically equivalent, avoids sqrt) ---
+        {
+            const float3 delta   = result.rgb - previous.rgb;
+            const float  d2      = dot(delta, delta);
+            const float  thr2    = DDGIVolume.probeBrightnessThreshold * DDGIVolume.probeBrightnessThreshold;
+            const float3 clamped = previous.rgb + (delta * 0.25f);
+
+            const float clampMask = (d2 > thr2) ? 1.0f : 0.0f;
+            result.rgb = lerp(result.rgb, clamped, clampMask);
+        }
+
+        // --- Hysteresis blend with darkening floor step (preserve exact logic) ---
+        {
+            static const float c_threshold = 1.0f / 1024.0f;
+
+            const float3 delta = result.rgb - previous.rgb;
+            const float  oneMinusH = 1.0f - hysteresis;
+            float3 lerpDelta = delta * oneMinusH;
+
+            // Darkening test uses max component comparison, as original
+            const float resMax = RTXGIMaxComponent(result.rgb);
+            const float prvMax = RTXGIMaxComponent(previous.rgb);
+            const float darkenMask = (resMax < prvMax) ? 1.0f : 0.0f;
+
+            const float3 absLerp  = abs(lerpDelta);
+            const float3 absDelta = abs(delta);
+            const float3 limited  = min(max(c_threshold, absLerp), absDelta) * sign(lerpDelta);
+
+            // Select limited step only when darkening
+            lerpDelta = lerp(lerpDelta, limited, darkenMask);
+
+            result = float4(previous.rgb + lerpDelta, 1.0f);
+        }
 
 #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
     }
@@ -398,7 +467,8 @@ void DDGIProbeBlendingCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Grou
     if (probeSpace.x == prevProbeSpace.x && probeSpace.y == prevProbeSpace.y && probeSpace.z == prevProbeSpace.z)
     {
 #endif
-       result = float4(lerp(result.rgb, previous.rgb, hysteresis), 1.f);
+       //result = float4(lerp(result.rgb, previous.rgb, hysteresis), 1.f);
+        result = float4(mad(previous.rgb - result.rgb, hysteresis, result.rgb), 1.0f); // Optimized by RedPixel
 #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
     }
 #endif
