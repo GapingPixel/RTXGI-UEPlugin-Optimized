@@ -20,116 +20,112 @@
 // #define PROBE_DATA_REGISTER u2
 
 // For example usage, see Harness.cpp::CompileVolumeShaders() in the Test Harness.
-
+//Fully optimized by RedPixel
 // --------------------------------------------------------------------------------------
-
 #include "/Engine/Private/Common.ush"
 #include "../DDGIVolumeDefines.ush"
 
 // Probe irradiance or filtered distance
 RWTexture2D<float4> DDGIVolumeProbeDataUAV;
 
+// ---- Compile-time helpers (use bit tricks when (PROBE_NUM_TEXELS+2) is a power of two: 8 or 16) ----
+#define PROBE_SIDE_LEN         ( (PROBE_NUM_TEXELS) + 2 )
+#define PROBE_SIDE_LEN_M1      ( (PROBE_SIDE_LEN) - 1 )
+#if ( (PROBE_SIDE_LEN & (PROBE_SIDE_LEN - 1)) == 0 )
+    #define PROBE_SIDE_IS_POW2 1
+#else
+    #define PROBE_SIDE_IS_POW2 0
+#endif
+
+// Mod and align-down by side length (compile to & / mask when possible)
+#define MOD_SIDE(v)      ( PROBE_SIDE_IS_POW2 ? ((v) & PROBE_SIDE_LEN_M1) : ((v) % PROBE_SIDE_LEN) )
+#define ALIGN_DOWN(v)    ( PROBE_SIDE_IS_POW2 ? ((v) & ~PROBE_SIDE_LEN_M1) : ( ((v) / PROBE_SIDE_LEN) * PROBE_SIDE_LEN ) )
+
+// ---------------------------------------------------------------------------------------------------------------------
+
 [numthreads(8, 8, 1)]
 void DDGIProbeBorderRowUpdateCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 {
-    uint probeSideLength = (PROBE_NUM_TEXELS + 2);
-    uint probeSideLengthMinusOne = (probeSideLength - 1);
-
-    // Map thread index to border row texel coordinates
-    uint2 threadCoordinates = DispatchThreadID.xy;
-    threadCoordinates.y *= probeSideLength;
+    // Map thread index to border row texel coordinates (each probe row spans PROBE_SIDE_LEN texels)
+    uint2 tc = DispatchThreadID.xy;
+    tc.y *= PROBE_SIDE_LEN;
 
     // Ignore the corner texels
-    int mod = (DispatchThreadID.x % probeSideLength);
-    if (mod == 0 || mod == probeSideLengthMinusOne)
-    {
-        return;
-    }
+    const uint modx = MOD_SIDE(DispatchThreadID.x);
+    if (modx == 0u || modx == PROBE_SIDE_LEN_M1) return;
 
-    // Compute the interior texel coordinates to copy (top row)
-    uint probeStart = uint(threadCoordinates.x / probeSideLength) * probeSideLength;
-    uint offset = probeSideLengthMinusOne - (threadCoordinates.x % probeSideLength);
-
-    uint2 copyCoordinates = uint2(probeStart + offset, (threadCoordinates.y + 1));
+    // Compute interior texel X to copy from (top/bottom rows)
+    const uint probeStart = ALIGN_DOWN(DispatchThreadID.x);
+    const uint offset     = PROBE_SIDE_LEN_M1 - modx;
+    const uint copyX      = probeStart + offset;
 
 #if RTXGI_DDGI_DEBUG_BORDER_COPY_INDEXING && (RTXGI_DDGI_FORMAT_IRRADIANCE == 1)
-    DDGIVolumeProbeDataUAV[threadCoordinates] = float4(threadCoordinates, copyCoordinates);
-    threadCoordinates.y += probeSideLengthMinusOne;
-    copyCoordinates = uint2(probeStart + offset, threadCoordinates.y - 1);
-    DDGIVolumeProbeDataUAV[threadCoordinates] = float4(threadCoordinates, copyCoordinates);
-    return;
-#endif
-
-    // Top row
-    DDGIVolumeProbeDataUAV[threadCoordinates] = DDGIVolumeProbeDataUAV[copyCoordinates];
-
-    // Compute the interior texel coordinate to copy (bottom row)
-    threadCoordinates.y += probeSideLengthMinusOne;
-    copyCoordinates = uint2(probeStart + offset, threadCoordinates.y - 1);
-
+    // Top row (debug writes indices)
+    DDGIVolumeProbeDataUAV[tc] = float4(tc, uint2(copyX, tc.y + 1));
     // Bottom row
-    DDGIVolumeProbeDataUAV[threadCoordinates] = DDGIVolumeProbeDataUAV[copyCoordinates];
+    const uint2 tcBot = uint2(tc.x, tc.y + PROBE_SIDE_LEN_M1);
+    DDGIVolumeProbeDataUAV[tcBot] = float4(tcBot, uint2(copyX, tcBot.y - 1));
+    return;
+#else
+    // Top row
+    DDGIVolumeProbeDataUAV[tc] = DDGIVolumeProbeDataUAV[uint2(copyX, tc.y + 1)];
+    // Bottom row
+    tc.y += PROBE_SIDE_LEN_M1;
+    DDGIVolumeProbeDataUAV[tc] = DDGIVolumeProbeDataUAV[uint2(copyX, tc.y - 1)];
+#endif
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
 
 [numthreads(8, 8, 1)]
 void DDGIProbeBorderColumnUpdateCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 {
-    uint probeSideLength = (PROBE_NUM_TEXELS + 2);
-    uint probeSideLengthMinusOne = (probeSideLength - 1);
+    // Map thread index to border column texel coordinates (each probe column spans PROBE_SIDE_LEN texels)
+    uint2 tc = DispatchThreadID.xy;
+    tc.x *= PROBE_SIDE_LEN;
 
-    // Map thread index to border row texel coordinates
-    uint2 threadCoordinates = DispatchThreadID.xy;
-    threadCoordinates.x *= probeSideLength;
-
-    uint2 copyCoordinates = uint2(0, 0);
-
-    // Handle the corner texels
-    int mod = (threadCoordinates.y % probeSideLength);
-    if (mod == 0 || mod == probeSideLengthMinusOne)
+    // Handle the corner texels (top/bottom corners of the column)
+    const uint mody = MOD_SIDE(tc.y);
+    if (mody == 0u || mody == PROBE_SIDE_LEN_M1)
     {
-        // Left corner
-        copyCoordinates.x = threadCoordinates.x + PROBE_NUM_TEXELS;
-        copyCoordinates.y = threadCoordinates.y - sign(mod - 1) * PROBE_NUM_TEXELS;
+        // Left corner copies from interior opposite edge
+        uint2 copy = uint2(tc.x + PROBE_NUM_TEXELS, tc.y - (uint)sign((int)mody - 1) * PROBE_NUM_TEXELS);
 
     #if RTXGI_DDGI_DEBUG_BORDER_COPY_INDEXING && (RTXGI_DDGI_FORMAT_IRRADIANCE == 1)
-        DDGIVolumeProbeDataUAV[threadCoordinates] = float4(threadCoordinates, copyCoordinates);
+        DDGIVolumeProbeDataUAV[tc] = float4(tc, copy);
     #else
-        DDGIVolumeProbeDataUAV[threadCoordinates] = DDGIVolumeProbeDataUAV[copyCoordinates];
+        DDGIVolumeProbeDataUAV[tc] = DDGIVolumeProbeDataUAV[copy];
     #endif
 
         // Right corner
-        threadCoordinates.x += probeSideLengthMinusOne;
-        copyCoordinates.x = threadCoordinates.x - PROBE_NUM_TEXELS;
+        tc.x += PROBE_SIDE_LEN_M1;
+        copy.x = tc.x - PROBE_NUM_TEXELS;
 
     #if RTXGI_DDGI_DEBUG_BORDER_COPY_INDEXING & (RTXGI_DDGI_FORMAT_IRRADIANCE == 1)
-        DDGIVolumeProbeDataUAV[threadCoordinates] = float4(threadCoordinates, copyCoordinates);
+        DDGIVolumeProbeDataUAV[tc] = float4(tc, copy);
     #else
-        DDGIVolumeProbeDataUAV[threadCoordinates] = DDGIVolumeProbeDataUAV[copyCoordinates];
+        DDGIVolumeProbeDataUAV[tc] = DDGIVolumeProbeDataUAV[copy];
     #endif
         return;
     }
 
-    // Compute the interior texel coordinates to copy (left column)
-    uint probeStart = uint(threadCoordinates.y / probeSideLength) * probeSideLength;
-    uint offset = probeSideLengthMinusOne - (threadCoordinates.y % probeSideLength);
-
-    copyCoordinates = uint2(threadCoordinates.x + 1, probeStart + offset);
+    // Compute interior texel Y to copy from (left/right columns)
+    const uint probeStart = ALIGN_DOWN(tc.y);
+    const uint offset     = PROBE_SIDE_LEN_M1 - mody;
+    const uint copyY      = probeStart + offset;
 
 #if RTXGI_DDGI_DEBUG_BORDER_COPY_INDEXING && (RTXGI_DDGI_FORMAT_IRRADIANCE == 1)
-    DDGIVolumeProbeDataUAV[threadCoordinates] = float4(threadCoordinates, copyCoordinates);
-    threadCoordinates.x += probeSideLengthMinusOne;
-    copyCoordinates = uint2(threadCoordinates.x - 1, probeStart + offset);
-    DDGIVolumeProbeDataUAV[threadCoordinates] = float4(threadCoordinates, copyCoordinates);
+    // Left column (debug)
+    DDGIVolumeProbeDataUAV[tc] = float4(tc, uint2(tc.x + 1, copyY));
+    // Right column (debug)
+    const uint2 tcRight = uint2(tc.x + PROBE_SIDE_LEN_M1, tc.y);
+    DDGIVolumeProbeDataUAV[tcRight] = float4(tcRight, uint2(tcRight.x - 1, copyY));
     return;
-#endif
-
+#else
     // Left column
-    DDGIVolumeProbeDataUAV[threadCoordinates] = DDGIVolumeProbeDataUAV[copyCoordinates];
-
-    // Compute the interior texel coordinate to copy (right column)
-    threadCoordinates.x += probeSideLengthMinusOne;
-    copyCoordinates = uint2(threadCoordinates.x - 1, probeStart + offset);
-
+    DDGIVolumeProbeDataUAV[tc] = DDGIVolumeProbeDataUAV[uint2(tc.x + 1, copyY)];
     // Right column
-    DDGIVolumeProbeDataUAV[threadCoordinates] = DDGIVolumeProbeDataUAV[copyCoordinates];
+    tc.x += PROBE_SIDE_LEN_M1;
+    DDGIVolumeProbeDataUAV[tc] = DDGIVolumeProbeDataUAV[uint2(tc.x - 1, copyY)];
+#endif
 }
