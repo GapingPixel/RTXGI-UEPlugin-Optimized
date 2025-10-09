@@ -7,7 +7,6 @@
 * distribution of this software and related documentation without an express
 * license agreement from NVIDIA CORPORATION is strictly prohibited.
 */
-
 #include "/Engine/Private/HairStrands/HairStrandsVoxelPageCommonStruct.ush"
 #include "/Engine/Private/Common.ush"
 
@@ -18,7 +17,6 @@
 #define SUPPORT_CONTACT_SHADOWS 0
 
 #if UE4_COMPAT
-// from RayTracingPrimaryRays.usf - see that .cpp for how to pass all these params properly
 #define LTCMatTexture               RaytracingLightsDataPacked.LTCMatTexture
 #define LTCMatSampler               RaytracingLightsDataPacked.LTCMatSampler
 #define LTCAmpTexture               RaytracingLightsDataPacked.LTCAmpTexture
@@ -71,16 +69,17 @@ int                 DDGIVolume_ProbeIndexCount;
 float3              Sky_Color;
 TextureCube<float4> Sky_Texture;
 SamplerState        Sky_TextureSampler;
-
 // END RGS PARAMS
+
+// --------------------------------------------------------------------------------------
 
 float3 GetEnvironmentalRadiance(in float3 direction)
 {
-#if RTXGI_DDGI_SKY_LIGHT_TYPE == 0 // None
-    return 0.f;
-#elif RTXGI_DDGI_SKY_LIGHT_TYPE == 1 // Raster
+#if RTXGI_DDGI_SKY_LIGHT_TYPE == 0
+    return 0.0f.xxx;
+#elif RTXGI_DDGI_SKY_LIGHT_TYPE == 1
     return Sky_Color * GetSkySHDiffuse(direction);
-#else // RTXGI_DDGI_SKY_LIGHT_TYPE == 2 // Ray Tracing
+#else
     return Sky_Color * TextureCubeSampleLevel(Sky_Texture, Sky_TextureSampler, direction, 0).rgb;
 #endif
 }
@@ -88,117 +87,113 @@ float3 GetEnvironmentalRadiance(in float3 direction)
 void WriteRadianceOutput(uint2 DispatchIndex, float4 value)
 {
 #if !RTXGI_DDGI_FORMAT_RADIANCE
-    static const float c_threshold = 1.f / 255.f;
-    if (RTXGIMaxComponent(value.rgb) <= c_threshold) value.rgb = float3(0.f, 0.f, 0.f);
+    const float c_threshold = 1.0f / 255.0f;
+    if (RTXGIMaxComponent(value.rgb) <= c_threshold) value.rgb = 0.0f.xxx;
 #endif
 
-    // Radiance / irradiance is multipled by this when stored, but divided by this when recalled.
-    // This feature is to avoid clipping when using the 10 bit texture format.
+    // Store scaled; reader will divide by same scalar.
     value.rgb *= DDGIVolume_IrradianceScalar;
 
 #if RTXGI_DDGI_FORMAT_RADIANCE
-    // Use R32G32B32A32_FLOAT format. Store color components and hit distance as 32-bit float values.
-    RadianceOutput[DispatchIndex.xy] = value;
+    RadianceOutput[DispatchIndex] = value;
 #else
-    // Use R32G32_FLOAT format (don't use R32G32_UINT since hit distance needs to be negative sometimes).
-    // Pack color as R10G10B10 in R32 and store hit distance in G32.
-    RadianceOutput[DispatchIndex.xy] = float4(asfloat(RTXGIFloat3ToUint(clamp(value.rgb, 0.0f, 1.0f))), value.w, 0.f, 0.f);
+    const uint packed = RTXGIFloat3ToUint(saturate(value.rgb));
+    RadianceOutput[DispatchIndex] = float4(asfloat(packed), value.w, 0.0f, 0.0f);
 #endif
 
 #if DDGIVolumeUpdateDebug != 0
-    DebugOutput[DispatchIndex.xy] = value;
+    DebugOutput[DispatchIndex] = value;
 #endif
 }
+
+// --------------------------------------------------------------------------------------
 
 RAY_TRACING_ENTRY_RAYGEN(ProbeUpdateRGS)
 {
     // Adapted from ProbeTraceRGS.hlsl in the test harness aiming for minimal changes to help future merges.
+    float4 result = 0.0f.xxxx;
 
-    float4 result = 0.f;
-
-    uint2 DispatchIndex = DispatchRaysIndex().xy;
-    int rayIndex = DispatchIndex.x;                    // index of ray within a probe
-    int probeIndex = DispatchIndex.y;                  // index of current probe
+    const uint2 DispatchIndex = DispatchRaysIndex().xy;
+    const int   rayIndex   = (int)DispatchIndex.x;
+    const int   probeIndex = (int)DispatchIndex.y;
 
 #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
-    int storageProbeIndex = DDGIGetProbeIndexOffset(probeIndex, DDGIVolume_probeGridCounts, DDGIVolume_probeScrollOffsets);
+    const int storageProbeIndex = DDGIGetProbeIndexOffset(probeIndex, DDGIVolume_probeGridCounts, DDGIVolume_probeScrollOffsets);
 #else
-    int storageProbeIndex = probeIndex;
+    const int storageProbeIndex = probeIndex;
 #endif
-    int2 texelPosition = DDGIGetProbeTexelPosition(storageProbeIndex, DDGIVolume_probeGridCounts);
+    const int2 texelPosition = DDGIGetProbeTexelPosition(storageProbeIndex, DDGIVolume_probeGridCounts);
 
 #if RTXGI_DDGI_PARTIAL_UPDATE_ISV
-    uint3 prevProbeSpace;
-    prevProbeSpace.x = DDGIProbeScrollSpace[texelPosition].x & 0x01;
-    prevProbeSpace.y = (DDGIProbeScrollSpace[texelPosition].x & 0x02) >> 1;
-    prevProbeSpace.z = (DDGIProbeScrollSpace[texelPosition].x & 0x04) >> 2;
-
-    uint3 probeSpace = uint3(0, 0, 0);
-
-    int3 probeGridCoord = DDGIGetProbeCoords(probeIndex, DDGIVolume.probeGridCounts);
-    probeSpace = (probeGridCoord + DDGIVolume.probeScrollOffsets) / (DDGIVolume.probeGridCounts);
-    probeSpace = probeSpace % 2;
-    if(prevProbeSpace.x == probeSpace.x && prevProbeSpace.y == probeSpace.y && prevProbeSpace.z == probeSpace.z)
-        return;
-#else
-    // Handle round robin updating.
-    // If this probe is outside of the window for updating, bail out.
     {
-        int numProbes = DDGIVolume_probeGridCounts.x * DDGIVolume_probeGridCounts.y * DDGIVolume_probeGridCounts.z;
-        int probeRRIndex = (probeIndex < DDGIVolume_ProbeIndexStart) ? probeIndex + numProbes : probeIndex;
+        const uint scrollVal = DDGIProbeScrollSpace[texelPosition].x;
+        const uint3 prevProbeSpace = uint3(
+            scrollVal & 1u,
+            (scrollVal >> 1u) & 1u,
+            (scrollVal >> 2u) & 1u
+        );
+
+        const int3 probeGridCoord = DDGIGetProbeCoords(probeIndex, DDGIVolume.probeGridCounts);
+        // floor((coord+offset)/counts) & 1  (use &1 instead of %2)
+        const uint3 probeSpace = (uint3)((probeGridCoord + DDGIVolume.probeScrollOffsets) / DDGIVolume.probeGridCounts) & 1u;
+
+        if (all(prevProbeSpace == probeSpace))
+            return;
+    }
+#else
+    // Round-robin window check, bail early if outside.
+    {
+        const int numProbes = DDGIVolume_probeGridCounts.x * DDGIVolume_probeGridCounts.y * DDGIVolume_probeGridCounts.z;
+        const int probeRRIndex = (probeIndex < DDGIVolume_ProbeIndexStart) ? (probeIndex + numProbes) : probeIndex;
         if (probeRRIndex >= DDGIVolume_ProbeIndexStart + DDGIVolume_ProbeIndexCount)
             return;
     }
 #endif
 
 #if RTXGI_DDGI_PROBE_CLASSIFICATION
-    int  probeState = DDGIVolume_ProbeStates.Load(int3(texelPosition, 0));
+    const int probeState = DDGIVolume_ProbeStates.Load(int3(texelPosition, 0));
     if (probeState == PROBE_STATE_INACTIVE && rayIndex >= RTXGI_DDGI_NUM_FIXED_RAYS)
-    {
-       // if the probe is inactive, do not shoot rays, unless it is one of the fixed rays that could potentially reactivate the probe
-       return;
-    }
+        return;
 #endif
 
 #if RTXGI_DDGI_PROBE_RELOCATION
     #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
-    float3 probeWorldPosition = DDGIGetProbeWorldPositionWithOffset(probeIndex, DDGIVolume_origin, DDGIVolume_rotation, DDGIVolume_probeGridCounts, DDGIVolume_probeGridSpacing, DDGIVolume_probeScrollOffsets, DDGIVolume_ProbeOffsets);
+    const float3 probeWorldPosition = DDGIGetProbeWorldPositionWithOffset(probeIndex, DDGIVolume_origin, DDGIVolume_rotation, DDGIVolume_probeGridCounts, DDGIVolume_probeGridSpacing, DDGIVolume_probeScrollOffsets, DDGIVolume_ProbeOffsets);
     #else
-    float3 probeWorldPosition = DDGIGetProbeWorldPositionWithOffset(probeIndex, DDGIVolume_origin, DDGIVolume_rotation, DDGIVolume_probeGridCounts, DDGIVolume_probeGridSpacing, DDGIVolume_ProbeOffsets);
+    const float3 probeWorldPosition = DDGIGetProbeWorldPositionWithOffset(probeIndex, DDGIVolume_origin, DDGIVolume_rotation, DDGIVolume_probeGridCounts, DDGIVolume_probeGridSpacing, DDGIVolume_ProbeOffsets);
     #endif
 #else
-    float3 probeWorldPosition = DDGIGetProbeWorldPosition(probeIndex, DDGIVolume_origin, DDGIVolume_rotation, DDGIVolume_probeGridCounts, DDGIVolume_probeGridSpacing);
+    const float3 probeWorldPosition = DDGIGetProbeWorldPosition(probeIndex, DDGIVolume_origin, DDGIVolume_rotation, DDGIVolume_probeGridCounts, DDGIVolume_probeGridSpacing);
 #endif
 
-    float3 probeRayDirection = DDGIGetProbeRayDirection(rayIndex, DDGIVolume_numRaysPerProbe, DDGIVolume_probeRayRotationTransform);
+    const float3 probeRayDirection = DDGIGetProbeRayDirection(rayIndex, DDGIVolume_numRaysPerProbe, DDGIVolume_probeRayRotationTransform);
 
-    // Setup the probe ray
+    // Setup the ray
     RayDesc Ray;
-    Ray.Origin = probeWorldPosition;
+    Ray.Origin    = probeWorldPosition;
     Ray.Direction = probeRayDirection;
-    Ray.TMin = 0.f;
-    Ray.TMax = DDGIVolume_probeMaxRayDistance;
+    Ray.TMin      = 0.0f;
+    Ray.TMax      = DDGIVolume_probeMaxRayDistance;
 
-    const int ReflectedShadowsType = 1; // = hard shadows.  make configurable?
+    const int  ReflectedShadowsType = 1;
     const uint RayFlags = 0;
-    // Opaque and alpha tested meshes and particles (e.g. used by reflection, shadow, AO and GI tracing passes)
     const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
 
-    const bool bShouldDoDirectLighting = true;
+    const bool bShouldDoDirectLighting              = true;
     const bool bShouldDoEmissiveAndIndirectLighting = true;
-    const bool bRayTraceSkyLightContribution = false;
-    const bool bDecoupleSampleGeneration = true;
-    const bool bEnableSkyLightContribution = false;
+    const bool bRayTraceSkyLightContribution        = false;
+    const bool bDecoupleSampleGeneration            = true;
+    const bool bEnableSkyLightContribution          = false;
 
-    float3 PathVertexRadiance = float3(0, 0, 0);
-    FRayCone RayCone = (FRayCone)0;
-    float MaxNormalBias = 0.01f;
+    float3    PathVertexRadiance = 0.0f.xxx;
+    FRayCone  RayCone = (FRayCone)0;
+    float     MaxNormalBias = 0.01f;
 
     // Trace
-    uint linear_rand = DispatchIndex.x + DispatchIndex.y * 9973;
+    const uint linear_rand = DispatchIndex.x + DispatchIndex.y * 9973u;
     RandomSequence RandSequence;
     RandomSequence_Initialize(RandSequence, linear_rand, FrameRandomSeed);
-    uint2 PixelCoord = DispatchRaysIndex().xy; // Hmmmm.... does TraceRayAndAccumulateResults() assume screen-space trace or is this just for stochastics?  hopefully the latter but fixme:checkme
+    const uint2 PixelCoord = DispatchRaysIndex().xy;
 
     FMaterialClosestHitPayload Payload = TraceRayAndAccumulateResults(
         Ray,
@@ -217,74 +212,73 @@ RAY_TRACING_ENTRY_RAYGEN(ProbeUpdateRGS)
         bEnableSkyLightContribution,
         PathVertexRadiance);
 
-    // Adjust emissive contribution if we should
+    // Adjust emissive (fused)
     PathVertexRadiance += Payload.Radiance * (DDGIVolume_EmissiveMultiplier - 1.0f);
 
-    result = float4(PathVertexRadiance.xyz, Payload.HitT);
+    result = float4(PathVertexRadiance, Payload.HitT);
 
-    // Ray miss. Set hit distance to a large value and exit early.
+    // Miss → big hit distance, add environment, early out
     if (Payload.IsMiss())
     {
         result.rgb += GetEnvironmentalRadiance(Ray.Direction);
         result.w = 1e27f;
-        WriteRadianceOutput(DispatchIndex.xy, result);
+        WriteRadianceOutput(DispatchIndex, result);
         return;
     }
 
-    // Hit a surface backface. Set the radiance to black and exit early.
+    // Backface → encode negative shortened distance, early out
     if (!Payload.IsFrontFace() && Payload.ShadingModelID != SHADINGMODELID_TWOSIDED_FOLIAGE)
     {
-        // Shorten the hit distance on a backface hit by 80%
-        // Make distance negative to encode backface for the probe position preprocess.
-        WriteRadianceOutput(DispatchIndex.xy, float4(0.0f, 0.0f, 0.0f, -Payload.HitT * 0.2f));
+        WriteRadianceOutput(DispatchIndex, float4(0.0f, 0.0f, 0.0f, -Payload.HitT * 0.2f));
         return;
     }
 
 #if RTXGI_DDGI_PROBE_CLASSIFICATION
-    // hit a frontface, but probe is inactive, so this ray will only be used for reclassification, don't need any lighting
     if (probeState == PROBE_STATE_INACTIVE)
     {
-        WriteRadianceOutput(DispatchIndex.xy, float4(0.0f, 0.0f, 0.0f, Payload.HitT));
+        WriteRadianceOutput(DispatchIndex, float4(0.0f, 0.0f, 0.0f, Payload.HitT));
         return;
     }
 #endif
 
-    float3 probeLighting = float3(0.0f, 0.0f, 0.0f);
+    // DDGI lighting
+    float3 probeLighting = 0.0f.xxx;
     {
-        float3 albedo = Payload.BaseColor - Payload.BaseColor * Payload.Metallic;
+        // Albedo = baseColor * (1-metallic)
+        const float3 albedo = Payload.BaseColor * (1.0f - Payload.Metallic);
 
-        // fill out a DDGIVolumeResources
+        // Fill resources
         DDGIVolumeResources resources;
-        {
-            resources.probeIrradianceSRV = DDGIVolume_ProbeIrradiance;
-            resources.probeDistanceSRV = DDGIVolume_ProbeDistance;
-            resources.bilinearSampler = DDGIVolume_LinearClampSampler;
-#if RTXGI_DDGI_PROBE_RELOCATION
-            resources.probeOffsetsSRV = DDGIVolume_ProbeOffsets;
-#endif
-#if RTXGI_DDGI_PROBE_CLASSIFICATION
-            resources.probeStatesSRV = DDGIVolume_ProbeStates;
-#endif
-        }
+        resources.probeIrradianceSRV = DDGIVolume_ProbeIrradiance;
+        resources.probeDistanceSRV   = DDGIVolume_ProbeDistance;
+        resources.bilinearSampler    = DDGIVolume_LinearClampSampler;
+    #if RTXGI_DDGI_PROBE_RELOCATION
+        resources.probeOffsetsSRV    = DDGIVolume_ProbeOffsets;
+    #endif
+    #if RTXGI_DDGI_PROBE_CLASSIFICATION
+        resources.probeStatesSRV     = DDGIVolume_ProbeStates;
+    #endif
 
+        // Volume descriptor
         DDGIVolumeDescGPU DDGIVolume_0;
-        DDGIVolume_0.origin = DDGIVolume_origin;
-        DDGIVolume_0.rotation = DDGIVolume_rotation;
-        DDGIVolume_0.probeMaxRayDistance = DDGIVolume_probeMaxRayDistance;
-        DDGIVolume_0.probeGridCounts = DDGIVolume_probeGridCounts;
-        DDGIVolume_0.probeRayRotationTransform = DDGIVolume_probeRayRotationTransform;
-        DDGIVolume_0.numRaysPerProbe = DDGIVolume_numRaysPerProbe;
-        DDGIVolume_0.probeGridSpacing = DDGIVolume_probeGridSpacing;
-        DDGIVolume_0.probeNumIrradianceTexels = DDGIVolume_probeNumIrradianceTexels;
-        DDGIVolume_0.probeNumDistanceTexels = DDGIVolume_probeNumDistanceTexels;
-        DDGIVolume_0.probeIrradianceEncodingGamma = DDGIVolume_probeIrradianceEncodingGamma;
-        DDGIVolume_0.normalBias = DDGIVolume_normalBias;
-        DDGIVolume_0.viewBias = DDGIVolume_viewBias;
-        DDGIVolume_0.probeScrollOffsets = DDGIVolume_probeScrollOffsets;
+        DDGIVolume_0.origin                      = DDGIVolume_origin;
+        DDGIVolume_0.rotation                    = DDGIVolume_rotation;
+        DDGIVolume_0.probeMaxRayDistance         = DDGIVolume_probeMaxRayDistance;
+        DDGIVolume_0.probeGridCounts             = DDGIVolume_probeGridCounts;
+        DDGIVolume_0.probeRayRotationTransform   = DDGIVolume_probeRayRotationTransform;
+        DDGIVolume_0.numRaysPerProbe             = DDGIVolume_numRaysPerProbe;
+        DDGIVolume_0.probeGridSpacing            = DDGIVolume_probeGridSpacing;
+        DDGIVolume_0.probeNumIrradianceTexels    = DDGIVolume_probeNumIrradianceTexels;
+        DDGIVolume_0.probeNumDistanceTexels      = DDGIVolume_probeNumDistanceTexels;
+        DDGIVolume_0.probeIrradianceEncodingGamma= DDGIVolume_probeIrradianceEncodingGamma;
+        DDGIVolume_0.normalBias                  = DDGIVolume_normalBias;
+        DDGIVolume_0.viewBias                    = DDGIVolume_viewBias;
+        DDGIVolume_0.probeScrollOffsets          = DDGIVolume_probeScrollOffsets;
 
-        // Get irradiance from the DDGIVolume
-        float3 surfacePosWS = Ray.Origin + Ray.Direction * Payload.HitT;
-        float3 surfaceBias = DDGIGetSurfaceBias(Payload.WorldNormal, Ray.Direction, DDGIVolume_0);
+        // Irradiance sample
+        const float3 surfacePosWS = mad(Ray.Direction, Payload.HitT, Ray.Origin);
+        const float3 surfaceBias  = DDGIGetSurfaceBias(Payload.WorldNormal, Ray.Direction, DDGIVolume_0);
+
         float3 irradiance = DDGIGetVolumeIrradiance(
             surfacePosWS,
             surfaceBias,
@@ -293,18 +287,19 @@ RAY_TRACING_ENTRY_RAYGEN(ProbeUpdateRGS)
             resources
         );
 
-        // Perfectly diffuse reflectors don't exist in the real world. Limit the BRDF
-        // albedo to a maximum value to account for the energy loss at each bounce.
-        float maxAlbedo = 0.9f;
+        // Limit BRDF albedo, scale by 1/pi and volume irradiance scalar
+        const float  maxAlbedo  = 0.9f;
+        const float  invPI      = 0.31830988618379067f; // 1/pi
+        const float  invIrr     = rcp(DDGIVolume_IrradianceScalar);
+        const float3 albClamped = min(albedo, maxAlbedo);
 
-        probeLighting = irradiance * (min(albedo, maxAlbedo) / RTXGI_PI);
-        probeLighting /= DDGIVolume_IrradianceScalar;
+        probeLighting = irradiance * (albClamped * (invPI * invIrr));
 
-        // don't apply volume lighting outside the volume
-        float3 relPos = abs(surfacePosWS - DDGIVolume_origin);
-        if ((relPos.x > DDGIVolume_Radius.x || relPos.y > DDGIVolume_Radius.y || relPos.z > DDGIVolume_Radius.z))
-            probeLighting = float3(0.0f, 0.0f, 0.0f);
+        // Zero lighting outside the volume (strict '>' as original)
+        const float3 relPos = abs(surfacePosWS - DDGIVolume_origin);
+        if (relPos.x > DDGIVolume_Radius.x || relPos.y > DDGIVolume_Radius.y || relPos.z > DDGIVolume_Radius.z)
+            probeLighting = 0.0f.xxx;
     }
 
-    WriteRadianceOutput(DispatchIndex.xy, float4(PathVertexRadiance.xyz + probeLighting, Payload.HitT));
+    WriteRadianceOutput(DispatchIndex, float4(result.rgb + probeLighting, Payload.HitT));
 }
