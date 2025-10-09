@@ -7,6 +7,7 @@
 * distribution of this software and related documentation without an express
 * license agreement from NVIDIA CORPORATION is strictly prohibited.
 */
+//Fully optimized file by RedPixel
 
 #ifndef RTXGI_DDGI_IRRADIANCE_HLSL
 #define RTXGI_DDGI_IRRADIANCE_HLSL
@@ -21,53 +22,30 @@ struct DDGIVolumeResources
     Texture2D<float4> probeOffsetsSRV;
 #endif
 #if RTXGI_DDGI_PROBE_CLASSIFICATION
-    Texture2D<uint> probeStatesSRV;
+    Texture2D<uint>   probeStatesSRV;
 #endif
-    SamplerState bilinearSampler;
+    SamplerState      bilinearSampler;
 };
 
-/**
-* Computes the surfaceBias parameter used by DDGIGetVolumeIrradiance().
-* The surfaceNormal and cameraDirection arguments are expected to be normalized.
-*/
-float3 DDGIGetSurfaceBias(float3 surfaceNormal, float3 cameraDirection, DDGIVolumeDescGPU volume)
+float3 DDGIGetSurfaceBias(float3 n, float3 v, DDGIVolumeDescGPU vol)
 {
-    return (surfaceNormal * volume.normalBias) + (-cameraDirection * volume.viewBias);
+    return mad(n, vol.normalBias, -v * vol.viewBias);
 }
 
-/**
-* Computes a blending weight for the given volume for blending between multiple volumes.
-* Return value of 1.0 means full contribution from this volume while 0.0 means no contribution.
-*/
-float DDGIGetVolumeBlendWeight(float3 worldPosition, DDGIVolumeDescGPU volume)
+float DDGIGetVolumeBlendWeight(float3 wp, DDGIVolumeDescGPU vol)
 {
-    // Start fully weighted
-    float volumeBlendWeight = 1.f;
-
-    float3 position = worldPosition - volume.origin;
-    position = RTXGIQuaternionRotate(position, RTXGIQuaternionConjugate(volume.rotation));
-
-    // Shift from [-n/2, n/2] to [0, n]
-    position += (volume.probeGridSpacing * (volume.probeGridCounts - 1)) * 0.5f;
-    float3 probeCoords = (position / volume.probeGridSpacing);
-
-    // Map numbers over the max to the range 0 to 1 for blending
-    float3 overProbeMax = (volume.probeGridCounts - 1.f) - probeCoords;
-
-    // Use the geometric mean across all axes for weight
-    volumeBlendWeight *= clamp(probeCoords.x, 0.f, 1.f);
-    volumeBlendWeight *= clamp(probeCoords.y, 0.f, 1.f);
-    volumeBlendWeight *= clamp(probeCoords.z, 0.f, 1.f);
-    volumeBlendWeight *= clamp(overProbeMax.x, 0.f, 1.f);
-    volumeBlendWeight *= clamp(overProbeMax.y, 0.f, 1.f);
-    volumeBlendWeight *= clamp(overProbeMax.z, 0.f, 1.f);
-
-    return volumeBlendWeight;
+    float4 qConj = RTXGIQuaternionConjugate(vol.rotation);
+    float3 p = RTXGIQuaternionRotate(wp - vol.origin, qConj);
+    float3 halfExtent = 0.5f * (vol.probeGridSpacing * (vol.probeGridCounts - 1));
+    p += halfExtent;
+    float3 invSpacing = rcp(vol.probeGridSpacing);
+    float3 probeCoords = p * invSpacing;
+    float3 over = (float3)(vol.probeGridCounts - 1) - probeCoords;
+    float3 a = saturate(probeCoords);
+    float3 b = saturate(over);
+    return (a.x * a.y * a.z) * (b.x * b.y * b.z);
 }
 
-/**
-* Samples irradiance from the given volume's probes using information about the surface, sampling direction, and volume.
-*/
 float3 DDGIGetVolumeIrradiance(
     float3 worldPosition,
     float3 surfaceBias,
@@ -75,153 +53,114 @@ float3 DDGIGetVolumeIrradiance(
     DDGIVolumeDescGPU volume,
     DDGIVolumeResources resources)
 {
-    float3 irradiance = float3(0.f, 0.f, 0.f);
-    float  accumulatedWeights = 0.f;
+    float3 irradiance = 0;
+    float  accumulatedWeights = 0;
 
-    // Bias the world space position
-    float3 biasedWorldPosition = (worldPosition + surfaceBias);
+    const float4 qConj = RTXGIQuaternionConjugate(volume.rotation);
+    const float3 biasedWorldPosition = worldPosition + surfaceBias;
+    const float3 invSpacing = rcp(volume.probeGridSpacing);
+    const float3 exponent = volume.probeIrradianceEncodingGamma * 0.5f;
 
-    // Get the 3D grid coordinates of the base probe (near the biased world position)
-    int3   baseProbeCoords = DDGIGetBaseProbeGridCoords(biasedWorldPosition, volume.origin, volume.rotation, volume.probeGridCounts, volume.probeGridSpacing);
-
-    // Get the world space position of the base probe
+    int3 baseProbeCoords = DDGIGetBaseProbeGridCoords(biasedWorldPosition, volume.origin, volume.rotation, volume.probeGridCounts, volume.probeGridSpacing);
     float3 baseProbeWorldPosition = DDGIGetProbeWorldPosition(baseProbeCoords, volume.origin, volume.rotation, volume.probeGridCounts, volume.probeGridSpacing);
 
-    // Clamp the distance between the given point and the base probe's world position (on each axis) to [0, 1]
-    float3 distanceVolumeSpace = RTXGIQuaternionRotate(biasedWorldPosition - baseProbeWorldPosition, RTXGIQuaternionConjugate(volume.rotation));
-    float3 alpha = clamp((distanceVolumeSpace / volume.probeGridSpacing), float3(0.f, 0.f, 0.f), float3(1.f, 1.f, 1.f));
+    float3 distanceVolumeSpace = RTXGIQuaternionRotate(biasedWorldPosition - baseProbeWorldPosition, qConj);
+    float3 alpha = saturate(distanceVolumeSpace * invSpacing);
 
-    // Iterate over the 8 closest probes and accumulate their contributions
-    for(int probeIndex = 0; probeIndex < 8; probeIndex++)
+    [unroll]
+    for (int i = 0; i < 8; ++i)
     {
-        // Compute the offset to the adjacent probe in grid coordinates by
-        // sourcing the offsets from the bits of the loop index: x = bit 0, y = bit 1, z = bit 2
-        int3 adjacentProbeOffset = int3(probeIndex, probeIndex >> 1, probeIndex >> 2) & int3(1, 1, 1);
+        const int ox =  (i     ) & 1;
+        const int oy = ((i >> 1) & 1);
+        const int oz = ((i >> 2) & 1);
 
-        // Get the 3D grid coordinates of the adjacent probe by adding the offset to the base probe
-        // Clamp to the grid boundaries
-        int3 adjacentProbeCoords = clamp(baseProbeCoords + adjacentProbeOffset, int3(0, 0, 0), volume.probeGridCounts - int3(1, 1, 1));
+        int3 adjCoords = clamp(baseProbeCoords + int3(ox,oy,oz), int3(0,0,0), volume.probeGridCounts - int3(1,1,1));
 
-        // Get the adjacent probe's world position
     #if RTXGI_DDGI_PROBE_RELOCATION
         #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
-            float3 adjacentProbeWorldPosition = DDGIGetProbeWorldPositionWithOffset(adjacentProbeCoords, volume.origin, volume.rotation, volume.probeGridCounts, volume.probeGridSpacing, volume.probeScrollOffsets, resources.probeOffsetsSRV);
+            float3 adjWS = DDGIGetProbeWorldPositionWithOffset(adjCoords, volume.origin, volume.rotation, volume.probeGridCounts, volume.probeGridSpacing, volume.probeScrollOffsets, resources.probeOffsetsSRV);
         #else
-            float3 adjacentProbeWorldPosition = DDGIGetProbeWorldPositionWithOffset(adjacentProbeCoords, volume.origin, volume.rotation, volume.probeGridCounts, volume.probeGridSpacing, resources.probeOffsetsSRV);
+            float3 adjWS = DDGIGetProbeWorldPositionWithOffset(adjCoords, volume.origin, volume.rotation, volume.probeGridCounts, volume.probeGridSpacing, resources.probeOffsetsSRV);
         #endif
     #else
-        float3 adjacentProbeWorldPosition = DDGIGetProbeWorldPosition(adjacentProbeCoords, volume.origin, volume.rotation, volume.probeGridCounts, volume.probeGridSpacing);
+        float3 adjWS = DDGIGetProbeWorldPosition(adjCoords, volume.origin, volume.rotation, volume.probeGridCounts, volume.probeGridSpacing);
     #endif
 
-        // Get the adjacent probe's index (used for texture lookups)
-        int adjacentProbeIndex = DDGIGetProbeIndex(adjacentProbeCoords, volume.probeGridCounts);
+        const int adjIndex = DDGIGetProbeIndex(adjCoords, volume.probeGridCounts);
 
-#if RTXGI_DDGI_PROBE_CLASSIFICATION
+    #if RTXGI_DDGI_PROBE_CLASSIFICATION
         {
-            #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
-                int probeIndex = DDGIGetProbeIndexOffset(adjacentProbeIndex, volume.probeGridCounts, volume.probeScrollOffsets);
-            #else
-                int probeIndex = adjacentProbeIndex;
-            #endif
-
-            // If the probe is marked as inactive, don't allow it to contribute to indirect lighting
-            int2 texelPosition = DDGIGetProbeTexelPosition(probeIndex, volume.probeGridCounts);
-            int  probeState = resources.probeStatesSRV[texelPosition];
-            if (probeState == PROBE_STATE_INACTIVE) continue;
+        #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
+            const int sIndex = DDGIGetProbeIndexOffset(adjIndex, volume.probeGridCounts, volume.probeScrollOffsets);
+        #else
+            const int sIndex = adjIndex;
+        #endif
+            const int2 tp = DDGIGetProbeTexelPosition(sIndex, volume.probeGridCounts);
+            if (resources.probeStatesSRV[tp] == PROBE_STATE_INACTIVE) continue;
         }
-#endif
+    #endif
 
-        // Compute the distance and direction from the (biased and non-biased) shading point and the adjacent probe
-        float3 worldPosToAdjProbe = normalize(adjacentProbeWorldPosition - worldPosition);
-        float3 biasedPosToAdjProbe = normalize(adjacentProbeWorldPosition - biasedWorldPosition);
-        float  biasedPosToAdjProbeDist = length(adjacentProbeWorldPosition - biasedWorldPosition);
+        float3 v0 = adjWS - worldPosition;
+        float3 v1 = adjWS - biasedWorldPosition;
 
-        // Compute trilinear weights based on the distance to each adjacent probe
-        // to smoothly transition between probes. adjacentProbeOffset is binary, so we're
-        // using a 1-alpha when adjacentProbeOffset = 0 and alpha when adjacentProbeOffset = 1.
-        float3 trilinear = max(0.001f, lerp(1.f - alpha, alpha, adjacentProbeOffset));
-        float  trilinearWeight = (trilinear.x * trilinear.y * trilinear.z);
-        float  weight = 1.f;
+        const float3 worldPosToAdjProbe   = normalize(v0);
+        const float  biasedDist           = length(v1);
+        const float3 biasedPosToAdjProbe  = v1 * rcp(max(biasedDist, 1e-20f));
 
-        // A naive soft backface weight would ignore a probe when
-        // it is behind the surface. That's good for walls, but for
-        // small details inside of a room, the normals on the details
-        // might rule out all of the probes that have mutual visibility
-        // to the point. We instead use a "wrap shading" test. The small
-        // offset at the end reduces the "going to zero" impact.
-        float wrapShading = (dot(worldPosToAdjProbe, direction) + 1.f) * 0.5f;
-        weight *= (wrapShading * wrapShading) + 0.2f;
+        float3 trix = (2.0f * alpha - 1.0f);
+        float3 tri  = (1.0f - alpha) + float3((float)ox, (float)oy, (float)oz) * trix;
+        tri = max(tri, 0.001f);
+        float  triW = tri.x * tri.y * tri.z;
 
-        // Compute the texture coordinates of this adjacent probe and sample the probe's filtered distance
-        float2 octantCoords = DDGIGetOctahedralCoordinates(-biasedPosToAdjProbe);
+        float wrap = mad(dot(worldPosToAdjProbe, direction), 0.5f, 0.5f);
+        float w = wrap * wrap + 0.2f;
+        float weight = w;
+
+        float2 oct = DDGIGetOctahedralCoordinates(-biasedPosToAdjProbe);
     #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
-        float2 probeTextureCoords = DDGIGetProbeUV(adjacentProbeIndex, octantCoords, volume.probeGridCounts, volume.probeNumDistanceTexels, volume.probeScrollOffsets);
+        float2 probeUV = DDGIGetProbeUV(adjIndex, oct, volume.probeGridCounts, volume.probeNumDistanceTexels, volume.probeScrollOffsets);
     #else
-        float2 probeTextureCoords = DDGIGetProbeUV(adjacentProbeIndex, octantCoords, volume.probeGridCounts, volume.probeNumDistanceTexels);
+        float2 probeUV = DDGIGetProbeUV(adjIndex, oct, volume.probeGridCounts, volume.probeNumDistanceTexels);
     #endif
-        float2 filteredDistance = resources.probeDistanceSRV.SampleLevel(resources.bilinearSampler, probeTextureCoords, 0).rg;
+        float2 fd = resources.probeDistanceSRV.SampleLevel(resources.bilinearSampler, probeUV, 0).rg;
 
-        float meanDistanceToSurface = filteredDistance.x;
-        float variance = abs((filteredDistance.x * filteredDistance.x) - filteredDistance.y);
+        const float mean = fd.x;
+        const float var  = abs(mad(fd.x, fd.x, -fd.y));
+        const float v    = max(biasedDist - mean, 0.0f);
+        const float cheb = var * rcp(var + v * v);
+        const float cheb3 = cheb * cheb * cheb;
+        weight *= max(0.05f, cheb3);
+        weight  = max(0.000001f, weight);
 
-        float chebyshevWeight = 1.f;
-        if (biasedPosToAdjProbeDist > meanDistanceToSurface) // In "shadow"
-        {
-            // v must be greater than 0, which is guaranteed by the if condition above.
-            float v = biasedPosToAdjProbeDist - meanDistanceToSurface;
-            chebyshevWeight = variance / (variance + (v * v));
+        const float c = 0.2f;
+        const float m = step(c, weight);
+        const float invc2 = 1.0f / (c * c);
+        const float weightCrushed = (weight * weight * weight) * invc2;
+        weight = mad(m, (weight - weightCrushed), weightCrushed); // (m?weight:weightCrushed)
 
-            // Increase the contrast in the weight
-            chebyshevWeight = max((chebyshevWeight * chebyshevWeight * chebyshevWeight), 0.f);
-        }
+        weight *= triW;
 
-        // Avoid visibility weights ever going all the way to zero because
-        // when *no* probe has visibility we need a fallback value
-        weight *= max(0.05f, chebyshevWeight);
-
-        // Avoid a weight of zero
-        weight = max(0.000001f, weight);
-
-        // A small amount of light is visible due to logarithmic perception, so
-        // crush tiny weights but keep the curve continuous
-        const float crushThreshold = 0.2f;
-        if (weight < crushThreshold)
-        {
-            weight *= (weight * weight) * (1.f / (crushThreshold * crushThreshold));
-        }
-
-        // Apply the trilinear weights
-        weight *= trilinearWeight;
-
-        // Sample the probe irradiance
-        octantCoords = DDGIGetOctahedralCoordinates(direction);
+        oct = DDGIGetOctahedralCoordinates(direction);
     #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
-        probeTextureCoords = DDGIGetProbeUV(adjacentProbeIndex, octantCoords, volume.probeGridCounts, volume.probeNumIrradianceTexels, volume.probeScrollOffsets);
+        probeUV = DDGIGetProbeUV(adjIndex, oct, volume.probeGridCounts, volume.probeNumIrradianceTexels, volume.probeScrollOffsets);
     #else
-        probeTextureCoords = DDGIGetProbeUV(adjacentProbeIndex, octantCoords, volume.probeGridCounts, volume.probeNumIrradianceTexels);
+        probeUV = DDGIGetProbeUV(adjIndex, oct, volume.probeGridCounts, volume.probeNumIrradianceTexels);
     #endif
-        float3 probeIrradiance = resources.probeIrradianceSRV.SampleLevel(resources.bilinearSampler, probeTextureCoords, 0).rgb;
+        float3 probeIrr = resources.probeIrradianceSRV.SampleLevel(resources.bilinearSampler, probeUV, 0).rgb;
+        probeIrr = pow(probeIrr, exponent);
 
-        // Decode the tone curve, but leave a gamma = 2 curve to approximate sRGB blending
-        float3 exponent = volume.probeIrradianceEncodingGamma * 0.5f;
-        probeIrradiance = pow(probeIrradiance, exponent);
-
-        // Accumulate the weighted irradiance
-        irradiance += (weight * probeIrradiance);
+        irradiance += probeIrr * weight;
         accumulatedWeights += weight;
     }
 
-    // Avoid a divide by zero when weights sum to zero
-    if (accumulatedWeights == 0.f) return float3(0.f, 0.f, 0.f);
+    if (accumulatedWeights == 0.0f) return 0.0f.xxx;
 
-    irradiance *= (1.f / accumulatedWeights);   // Normalize by the accumulated weights
-    irradiance *= irradiance;                   // Go back to linear irradiance
-    irradiance *= RTXGI_2PI;                    // Multiply by the area of the integration domain (hemisphere) to complete the Monte Carlo Estimator equation
-
+    irradiance *= rcp(accumulatedWeights);
+    irradiance *= irradiance;
+    irradiance *= RTXGI_2PI;
 #if (RTXGI_DDGI_FORMAT_IRRADIANCE == 0)
-    irradiance *= 1.0989f;                      // Adjust for energy loss due to reduced precision in the R10G10B10A2 irradiance texture format
+    irradiance *= 1.0989f;
 #endif
-
     return irradiance;
 }
 
