@@ -63,7 +63,7 @@ static FMatrix44f ComputeRandomRotation()
 	// Also available at: http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.53.1357&rep=rep1&type=pdf
 
 	// Setup a random rotation matrix using 3 uniform RVs
-	float u1 = 2.f * 3.14159265359 * FMath::FRand();
+	/*OG float u1 = 2.f * 3.14159265359 * FMath::FRand();
 	float cos1 = std::cosf(u1);
 	float sin1 = std::sinf(u1);
 
@@ -96,6 +96,49 @@ static FMatrix44f ComputeRandomRotation()
 		FPlane4f(_21, _22, _23, 0.f ),
 		FPlane4f(_31, _32, _33, 0.f ),
 		FPlane4f(0.f, 0.f, 0.f, 1.f )
+	);*/
+	const float u1 = 6.28318530717958647692f * FMath::FRand();  
+	const float u2 = 6.28318530717958647692f * FMath::FRand();  
+	const float u3 = FMath::FRand();                
+
+	// sin/cos in one call each (lower overhead than separate std::sins)
+	float s1, c1;
+	FMath::SinCos(&s1, &c1, u1);
+
+	float s2, c2;
+	FMath::SinCos(&s2, &c2, u2);
+
+	// Precompute common terms
+	const float t   = 2.f * u3;                         
+	const float s2Sq = s2 * s2;
+	const float c2Sq = c2 * c2;
+
+	const float s2Term = t * s2Sq - 1.f;                
+	const float c2Term = t * c2Sq - 1.f;                
+	const float scTerm = t * s2 * c2;                   
+
+	const float sq3 = 2.f * FMath::Sqrt(u3 * (1.f - u3));
+	const float sq3c2 = sq3 * c2;
+	const float sq3s2 = sq3 * s2;
+
+	// Build rows (hoist multiplies; keep exact formulae)
+	const float _11 = c1 * c2Term - s1 * scTerm;
+	const float _12 = s1 * c2Term + c1 * scTerm;
+	const float _13 = sq3c2;
+
+	const float _21 = c1 * scTerm - s1 * s2Term;
+	const float _22 = s1 * scTerm + c1 * s2Term;
+	const float _23 = sq3s2;
+
+	const float _31 = c1 * sq3c2 - s1 * sq3s2;
+	const float _32 = s1 * sq3c2 + c1 * sq3s2;
+	const float _33 = 1.f - t;
+
+	return FMatrix44f(
+		FPlane4f(_11, _12, _13, 0.f),
+		FPlane4f(_21, _22, _23, 0.f),
+		FPlane4f(_31, _32, _33, 0.f),
+		FPlane4f(0.f,  0.f,  0.f,  1.f)
 	);
 }
 

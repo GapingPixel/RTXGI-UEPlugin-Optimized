@@ -15,6 +15,7 @@
 
 // VOLUME_LIST is defined by DDGIVolumeComponent.cpp and is a macro list like: VOLUME_ENTRY(0), VOLUME_ENTRY(1), etc
 
+
 Texture2D<float4>   NormalTexture;
 Texture2D<float>    DepthTexture;
 Texture2D<float4>   BaseColorTexture;
@@ -80,11 +81,11 @@ float4 ApplyVolumeLightingContribution(
     // Ignore the DDGIVolume if the lighting mask doesn't overlap
     #if USE_LIGHTING_CHANNELS
     if ((PixelLightingMask & VolumeLightingChannelMask) == 0)
-        return 0.f;
+        return 0.0f.xxxx;
     #endif
-
+//og
     // Ignore the DDGIVolume if the pixel is outside of the DDGIVolume
-    float3 RelPos = WorldPosition - Volume.origin;
+   /* float3 RelPos = WorldPosition - Volume.origin;
     RelPos = abs(RTXGIQuaternionRotate(RelPos, RTXGIQuaternionConjugate(Volume.rotation)));
     if ((RelPos.x > VolumeRadius.x || RelPos.y > VolumeRadius.y || RelPos.z > VolumeRadius.z))
         return 0.f;
@@ -131,6 +132,57 @@ float4 ApplyVolumeLightingContribution(
     else
         LightWeight.a = clamp((EdgeMinDist - BlendDistanceBlack) / BlendDistance, 0.0f, 1.0f);
 
+    return LightWeight;*/
+
+    //Optimization by RedPixel
+    // === Local space position and box test ===
+    const float4 qConj = RTXGIQuaternionConjugate(Volume.rotation);
+    float3 RelPos = abs(RTXGIQuaternionRotate(WorldPosition - Volume.origin, qConj));
+
+    // Early out if outside volume (prevents expensive sampling + bias calc)
+    if (RelPos.x > VolumeRadius.x || RelPos.y > VolumeRadius.y || RelPos.z > VolumeRadius.z)
+        return 0.0f.xxxx;
+
+    // === Base output ===
+    float4 LightWeight = 0.0f.xxxx;
+
+    // === Lighting (skip entirely if ApplyLighting <= 0) ===
+    // Keep branch to avoid calling into DDGI sampling when it's off.
+    if (ApplyLighting > 0.0f)
+    {
+        // Resources (only when used)
+        DDGIVolumeResources Resources;
+        Resources.probeIrradianceSRV = ProbeIrradiance;
+        Resources.probeDistanceSRV   = ProbeDistance;
+        Resources.bilinearSampler    = LinearClampSampler;
+        #if RTXGI_DDGI_PROBE_RELOCATION
+        Resources.probeOffsetsSRV    = ProbeOffsets;
+        #endif
+        #if RTXGI_DDGI_PROBE_CLASSIFICATION
+        Resources.probeStatesSRV     = ProbeStates;
+        #endif
+
+        // Surface bias and irradiance
+        const float3 SurfaceBias = DDGIGetSurfaceBias(Normal, CameraDirection, Volume);
+        const float3 Irradiance  = DDGIGetVolumeIrradiance(WorldPosition, SurfaceBias, Normal, Volume, Resources);
+
+        // Use rcp + invPI to avoid two divides
+        const float invPI = 0.31830988618379067154f; // 1/pi
+        const float invIrrScale = rcp(IrradianceScalar);
+        LightWeight.rgb = Irradiance * (Albedo * (invPI * invIrrScale));
+    }
+
+    // === Edge fade alpha (branchless select for BlendDistance==0 path) ===
+    const float3 EdgeDist   = VolumeRadius - RelPos;
+    const float  EdgeMinDist = min(EdgeDist.x, min(EdgeDist.y, EdgeDist.z));
+
+    const float  alpha0 = step(BlendDistanceBlack, EdgeMinDist);
+    const float  alpha1 = saturate((EdgeMinDist - BlendDistanceBlack) / BlendDistance);
+
+    // Exact zero check without FP tolerance (matches original semantics)
+    const uint   isZeroBD = (asuint(BlendDistance) == 0u) ? 1u : 0u;
+    LightWeight.a = lerp(alpha1, alpha0, (float)isZeroBD);
+
     return LightWeight;
 }
 
@@ -147,7 +199,9 @@ void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
     float3 InScreenVector = mul(float4(Position.xy, 1, 0), View.ScreenToTranslatedWorld).xyz;
 
     // Get information about our pixel
-    float2 BufferUV = (ViewUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy) * View.BufferSizeAndInvSize.zw;
+    //float2 BufferUV = (ViewUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy) * View.BufferSizeAndInvSize.zw; OG
+    //Optimization by RedPixel
+    float2 BufferUV = mad(ViewUV, View.ViewSizeAndInvSize.xy * View.BufferSizeAndInvSize.zw, View.ViewRectMin.xy * View.BufferSizeAndInvSize.zw);
     float DeviceZ = DepthTexture.SampleLevel(PointClampSampler, BufferUV, 0).r;
     float SceneDepth = ConvertFromDeviceZ(DeviceZ);
 #if UE4_COMPAT
@@ -160,14 +214,61 @@ void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
     float Metallic = MetallicTexture.SampleLevel(PointClampSampler, BufferUV, 0).r;
     float3 CameraDirection = normalize(InScreenVector);
 
+    //RedPixel Optimization
+    // Precompute constants once per thread
+    /*const float2 DispatchXY = (float2)DispatchThreadID.xy;
+    const float2 InvViewSize = View.ViewSizeAndInvSize.zw;
+    const float2 InvBufSize  = View.BufferSizeAndInvSize.zw;
+
+    // Compute PixelIndex & ViewUV
+    const int2 PixelIndex = int2(DispatchThreadID.xy) + ScaledViewOffset;
+    const float2 ViewUV   = mad(DispatchXY, InvViewSize, 0.5f * InvViewSize);  // (xy + 0.5) * invViewSize
+
+    // Compute nearest GBuffer UV (reuse ViewUV scaling factors)
+    const float2 GBufferUVScale = View.ViewSizeAndInvSize.xy * InvViewSize; // cached
+    const float2 GBufferNearestUV = mad(floor(ViewUV * View.ViewSizeAndInvSize.xy), InvViewSize, 0.5f * InvViewSize);
+
+    // Convert to clip space position (-1..1)
+    const float2 ClipXY = mad(GBufferNearestUV, float2(2.0f, -2.0f), float2(-1.0f, 1.0f));
+    const float4 Position = float4(ClipXY, 0.0f, 1.0f);
+
+    // Compute world-space direction (vector from camera)
+    const float3 InScreenVector = mul(Position.xyxy, View.ScreenToTranslatedWorld).xyz; // 2x2 multiply suffices (avoid w)
+    
+    // BufferUV optimized (RedPixel variant, fully fused)
+    const float2 BufferUV = mad(ViewUV, (View.ViewSizeAndInvSize.xy * InvBufSize), (View.ViewRectMin.xy * InvBufSize));
+
+    // Sample depth and reconstruct world position
+    const float DeviceZ = DepthTexture.SampleLevel(PointClampSampler, BufferUV, 0).r;
+    const float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+
+    #if UE4_COMPAT
+        const float3 WorldPosition = mad(InScreenVector, SceneDepth, View.WorldCameraOrigin);
+    #else
+        const float3 WorldPosition = mad(InScreenVector, SceneDepth, LWCHackToFloat(PrimaryView.WorldCameraOrigin));
+    #endif
+
+    // Sample material data (group samples to exploit locality)
+    const float4 NormalSample   = NormalTexture.SampleLevel(PointClampSampler, BufferUV, 0);
+    const float4 BaseColorSample = BaseColorTexture.SampleLevel(PointClampSampler, BufferUV, 0);
+    const float  Metallic       = MetallicTexture.SampleLevel(PointClampSampler, BufferUV, 0).r;
+
+    // Decode with normalization (fuse normalize ops)
+    const float3 Normal = normalize(DecodeNormal(NormalSample.xyz));
+    const float3 BaseColor = DecodeBaseColor(BaseColorSample.rgb);
+    const float3 CameraDirection = normalize(InScreenVector);*/
+
     float3 Albedo = 1.0f;
 
     // Upscaler won't be called so we need to modulate Albedo during this pass.
-    const bool bScalingDisabled = View.ViewSizeAndInvSize.x == ScaledViewSizeAndInvSize.x;
+    //OG Implementation
+    /*const bool bScalingDisabled = View.ViewSizeAndInvSize.x == ScaledViewSizeAndInvSize.x;
     if (bScalingDisabled)
     {
         Albedo = BaseColor - BaseColor * Metallic;
-    }
+    }*/
+    float bScalingDisabled = step(View.ViewSizeAndInvSize.x, ScaledViewSizeAndInvSize.x);
+    Albedo = lerp(1.0.xxx, BaseColor - BaseColor * Metallic, bScalingDisabled); //Optimization by RedPixel: branchless Albedo calc
 
     #if USE_LIGHTING_CHANNELS
     uint PixelLightingMask = uint(LightingChannelsTexture.Load(int3(GBufferNearestPixelIndex, 0)).x);
@@ -200,6 +301,7 @@ void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
     // Probes from overlapping volumes will accumulate very similar irradiance.
     // Therefore, as long as we are in fade region(-s), keep color from the densest volume, but max() the weight to preserve luminance of the fade.
     // Finally, if we are in non fade region of a specific volume, lerp() accumulated irradiance with irradiance from that volume.
+    
     #define VOLUME_ENTRY(x) \
         if (x < NumVolumes && AccLightWeight.a < 1.f) \
         { \
@@ -241,4 +343,5 @@ void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
     float PreExposure = ShouldUsePreExposure ? View.PreExposure : 1.0f;
 
     LightingPassUAV[PixelIndex] += float4(AccLightWeight.rgb * AccLightWeight.a * PreExposure, 0.f);
+    
 }

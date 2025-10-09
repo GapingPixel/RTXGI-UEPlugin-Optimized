@@ -190,12 +190,27 @@ float3 DDGIGetOctahedralDirection(float2 coords)
 */
 float2 DDGIGetOctahedralCoordinates(float3 direction)
 {
+    /*OG
     float l1norm = abs(direction.x) + abs(direction.y) + abs(direction.z);
     float2 uv = direction.xy * (1.f / l1norm);
     if (direction.z < 0.f)
     {
         uv = (1.f - abs(uv.yx)) * RTXGISignNotZero(uv.xy);
     }
+    return uv;*/
+    //RedPixel Optimization
+    // Precompute absolute values once
+    float3 adir = abs(direction);
+    float l1norm = adir.x + adir.y + adir.z;
+    float invL1 = rcp(l1norm); // Use reciprocal for faster division
+
+    float2 uv = direction.xy * invL1;
+    float2 s = RTXGISignNotZero(uv.xy);// Compute sign bits once (no branching)
+    // Compute alternate uv for negative z (folded octant)
+    float2 alt = (1.0f - abs(uv.yx)) * s;
+    // Branchless select using step()
+    float useAlt = step(direction.z, 0.0f);
+    uv = lerp(uv, alt, useAlt);
     return uv;
 }
 
@@ -208,22 +223,34 @@ float2 DDGIGetOctahedralCoordinates(float3 direction)
 * for the given index in a set of samples. Each direction is unique in
 * the set, but the set of directions is always the same.
 */
+static const float INV_PHI = 0.6180339887498948f;
 float3 DDGISphericalFibonacci(float index, float numSamples)
 {
-    const float b = (sqrt(5.f) * 0.5f + 0.5f) - 1.f;
-    float phi = RTXGI_2PI * frac(index * b);
-    float cosTheta = 1.f - (2.f * index + 1.f) * (1.f / numSamples);
-    float sinTheta = sqrt(saturate(1.f - (cosTheta * cosTheta)));
+    /*OG
+        const float b = (sqrt(5.f) * 0.5f + 0.5f) - 1.f;
+        float phi = RTXGI_2PI * frac(index * b);
+        float cosTheta = 1.f - (2.f * index + 1.f) * (1.f / numSamples);
+        float sinTheta = sqrt(saturate(1.f - (cosTheta * cosTheta)));
+    
+        return float3((cos(phi) * sinTheta), (sin(phi) * sinTheta), cosTheta);
+        */
+    //RedPixel Optimization
+    // Golden ratio constant (compile-time)
+    float phi = RTXGI_2PI * frac(index * INV_PHI); 
+    float invSamples = rcp(numSamples);
+    float cosTheta = 1.0f - (2.0f * index + 1.0f) * invSamples;
+    float sinTheta = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta));
 
-    return float3((cos(phi) * sinTheta), (sin(phi) * sinTheta), cosTheta);
+    float s, c;
+    sincos(phi, s, c);
+    return float3(c * sinTheta, s * sinTheta, cosTheta);
 }
-
 /**
 * Computes a ray direction for the given ray index.
 * Generate a spherically distributed normalized ray direction, then apply the given rotation transformation.
 */
 float3 DDGIGetProbeRayDirection(int rayIndex, int numRaysPerProbe, float4x4 rotationTransform)
-{
+{/*OG
 #if RTXGI_DDGI_PROBE_RELOCATION || RTXGI_DDGI_PROBE_CLASSIFICATION
     bool useFixedRays = rayIndex < RTXGI_DDGI_NUM_FIXED_RAYS;
     int  adjustedRayIndex = useFixedRays ? rayIndex : rayIndex - RTXGI_DDGI_NUM_FIXED_RAYS;
@@ -238,7 +265,31 @@ float3 DDGIGetProbeRayDirection(int rayIndex, int numRaysPerProbe, float4x4 rota
 #else
     float3 direction = DDGISphericalFibonacci(rayIndex, numRaysPerProbe);
 #endif
-    return normalize(mul(float4(direction, 0.f), rotationTransform).xyz);
+    return normalize(mul(float4(direction, 0.f), rotationTransform).xyz);*/
+#if RTXGI_DDGI_PROBE_RELOCATION || RTXGI_DDGI_PROBE_CLASSIFICATION
+    const bool useFixedRays = (rayIndex < RTXGI_DDGI_NUM_FIXED_RAYS);
+    const int fixedRays = min(RTXGI_DDGI_NUM_FIXED_RAYS, numRaysPerProbe);
+    const int adjustedRayIndex = rayIndex - (useFixedRays ? 0 : RTXGI_DDGI_NUM_FIXED_RAYS);
+    const int adjustedNumRays  = useFixedRays ? fixedRays : numRaysPerProbe - RTXGI_DDGI_NUM_FIXED_RAYS;
+
+    float3 dir = DDGISphericalFibonacci(adjustedRayIndex, adjustedNumRays);
+
+    // Branchless rotation: lerp between unrotated and rotated direction
+    float3 rotated = mul(rotationTransform, dir);
+    dir = lerp(rotated, dir, (float)useFixedRays);
+
+#else
+    float3 dir = DDGISphericalFibonacci(rayIndex, numRaysPerProbe);
+    float3 rotated = mul(rotationTransform, dir);
+    dir = rotated;
+#endif
+
+    // Normalize once only if rotation might not be perfectly orthonormal
+#if RTXGI_STRICT_NORMALIZATION
+    return normalize(dir);
+#else
+    return dir;
+#endif
 }
 
 //------------------------------------------------------------------------
@@ -293,7 +344,8 @@ int DDGIGetProbeIndex(uint2 threadCoords, int3 probeGridCounts, int probeNumTexe
 */
 uint2 DDGIGetThreadBaseCoords(int probeIndex, int3 probeGridCounts, int probeNumTexels)
 {
-    int probesPerPlane = DDGIGetProbesPerPlane(probeGridCounts);
+   // OG
+    /*int probesPerPlane = DDGIGetProbesPerPlane(probeGridCounts);
     int planeIndex = probeIndex / probesPerPlane;
     int probeIndexInPlane = probeIndex % probesPerPlane;
 
@@ -307,6 +359,26 @@ uint2 DDGIGetThreadBaseCoords(int probeIndex, int3 probeGridCounts, int probeNum
     int2 probeCoordInPlane = int2(probeIndexInPlane % planeWidthInProbes, probeIndexInPlane / planeWidthInProbes);
     int  baseCoordX = (planeWidthInProbes * planeIndex + probeCoordInPlane.x) * probeNumTexels;
     int  baseCoordY = probeCoordInPlane.y * probeNumTexels;
+    return uint2(baseCoordX, baseCoordY);*/
+    
+    //RedPixel Optimization
+    const int probesPerPlane = DDGIGetProbesPerPlane(probeGridCounts);
+    const int planeIndex = probeIndex / probesPerPlane;
+    const int probeIndexInPlane = probeIndex - planeIndex * probesPerPlane;
+
+#if RTXGI_COORDINATE_SYSTEM == RTXGI_COORDINATE_SYSTEM_LEFT_Z_UP
+    const int planeWidthInProbes = probeGridCounts.y;
+#else
+    const int planeWidthInProbes = probeGridCounts.x;
+#endif
+
+    const int probeY = probeIndexInPlane / planeWidthInProbes;
+    const int probeX = probeIndexInPlane - probeY * planeWidthInProbes;
+
+    // FMA-like integer math
+    const int baseCoordX = (planeWidthInProbes * planeIndex + probeX) * probeNumTexels;
+    const int baseCoordY = probeY * probeNumTexels;
+
     return uint2(baseCoordX, baseCoordY);
 }
 
@@ -342,6 +414,7 @@ int3 DDGIGetProbeCoords(int probeIndex, int3 probeGridCounts)
 */
 int3 DDGIGetBaseProbeGridCoords(float3 worldPosition, float3 origin, float4 rotation, int3 probeGridCounts, float3 probeGridSpacing)
 {
+    /*OG
     float3 position = worldPosition - origin;
     position = RTXGIQuaternionRotate(position, RTXGIQuaternionConjugate(rotation));
 
@@ -354,14 +427,22 @@ int3 DDGIGetBaseProbeGridCoords(float3 worldPosition, float3 origin, float4 rota
     // Snaps positions outside of grid to the grid edge
     probeCoords = clamp(probeCoords, int3(0, 0, 0), (probeGridCounts - int3(1, 1, 1)));
 
-    return probeCoords;
+    return probeCoords;*/
+    //RedPixel Optimization
+    float3 pos = worldPosition - origin;
+    pos = RTXGIQuaternionRotate(pos, RTXGIQuaternionConjugate(rotation));
+    // Precompute half-extent once
+    float3 halfExtent = (probeGridSpacing * (probeGridCounts - 1)) * 0.5f;
+    pos += halfExtent;
+    int3 probeCoords = int3(pos / probeGridSpacing);
+    return clamp(probeCoords, 0, probeGridCounts - 1);
 }
 
 /**
 * Computes the world space position of a probe at the given 3D grid coordinates.
 */
 float3 DDGIGetProbeWorldPosition(int3 probeCoords, float3 origin, float4 rotation, int3 probeGridCounts, float3 probeGridSpacing)
-{
+{/*OG
     // Multiply the grid coordinates by the grid spacing
     float3 probeGridWorldPosition = (probeCoords * probeGridSpacing);
 
@@ -372,7 +453,11 @@ float3 DDGIGetProbeWorldPosition(int3 probeCoords, float3 origin, float4 rotatio
     float3 probeWorldPosition = probeGridWorldPosition - probeGridShift;
     probeWorldPosition = RTXGIQuaternionRotate(probeWorldPosition, rotation);
     probeWorldPosition += origin;
-    return probeWorldPosition;
+    return probeWorldPosition;*/
+    //Optimization RedPixel
+    // Compute centered local-space position in one step:
+    float3 localPos = (float3(probeCoords) - 0.5f * (float3(probeGridCounts) - 1.0f)) * probeGridSpacing;
+    return RTXGIQuaternionRotate(localPos, rotation) + origin;
 }
 
 /*

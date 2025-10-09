@@ -115,10 +115,14 @@ void DDGIProbeBlendingCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Grou
     // If this probe is outside of the window for updating, bail out.
     [branch] if (!exitEarly)
     {
-        int numProbes = DDGIVolume.probeGridCounts.x * DDGIVolume.probeGridCounts.y * DDGIVolume.probeGridCounts.z;
+        /*int numProbes = DDGIVolume.probeGridCounts.x * DDGIVolume.probeGridCounts.y * DDGIVolume.probeGridCounts.z;
         int probeRRIndex = (probeIndex < ProbeIndexStart) ? probeIndex + numProbes : probeIndex;
         if (probeRRIndex >= ProbeIndexStart + ProbeIndexCount)
-            exitEarly = true;
+            exitEarly = true;*/
+        //RedPixel Optimization
+        int numProbes = DDGIVolume.probeGridCounts.x * DDGIVolume.probeGridCounts.y * DDGIVolume.probeGridCounts.z;
+        int probeRRIndex = probeIndex + ((probeIndex < ProbeIndexStart) ? numProbes : 0);
+        exitEarly = (probeRRIndex >= (ProbeIndexStart + ProbeIndexCount));
     }
 #endif
 
@@ -180,8 +184,9 @@ void DDGIProbeBlendingCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Grou
     {
         // Cooperatively load the ray traced radiance and hit distance values into shared memory
         // Cooperatively compute the probe ray directions
-        int totalIterations = int(ceil(float(RAYS_PER_PROBE) / float(PROBE_NUM_TEXELS * PROBE_NUM_TEXELS)));
-        for (int iteration = 0; iteration < totalIterations; iteration++)
+        //OG
+        /*int totalIterations = int(ceil(float(RAYS_PER_PROBE) / float(PROBE_NUM_TEXELS * PROBE_NUM_TEXELS)));
+        for (int iteration = 0; iteration < totalIterations; ++iteration)
         {
             int rayIndex = (GroupIndex * totalIterations) + iteration;
             if (rayIndex >= RAYS_PER_PROBE) break;
@@ -201,6 +206,34 @@ void DDGIProbeBlendingCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Grou
         #endif
 
             RayDirection[rayIndex] = DDGIGetProbeRayDirection(rayIndex, DDGIVolume.numRaysPerProbe, DDGIVolume.probeRayRotationTransform);
+        }*/
+        //RedPixel Optimization
+        int raysPerTexel = PROBE_NUM_TEXELS * PROBE_NUM_TEXELS;
+        int totalIterations = (RAYS_PER_PROBE + raysPerTexel - 1) / raysPerTexel;
+
+        for (int iteration = 0; iteration < totalIterations; ++iteration)
+        {
+            int rayIndex = GroupIndex * totalIterations + iteration;
+            if (rayIndex >= RAYS_PER_PROBE) continue;
+
+            // Cache once
+            float4 rayData = DDGIVolumeRayDataUAV[int2(rayIndex, probeIndex)];
+
+            #if RTXGI_DDGI_BLEND_RADIANCE
+            #if (RTXGI_DDGI_FORMAT_RADIANCE == 1)
+                        RayRadiance[rayIndex] = rayData.rgb;
+            #else
+                        RayRadiance[rayIndex] = RTXGIUintToFloat3(asuint(rayData.r));
+            #endif
+            #endif
+
+            #if (RTXGI_DDGI_FORMAT_RADIANCE == 1)
+                        RayDistance[rayIndex] = rayData.a;
+            #else
+                        RayDistance[rayIndex] = rayData.g;
+            #endif
+
+            RayDirection[rayIndex] = DDGIGetProbeRayDirection(rayIndex,DDGIVolume.numRaysPerProbe,DDGIVolume.probeRayRotationTransform);
         }
     }
 
