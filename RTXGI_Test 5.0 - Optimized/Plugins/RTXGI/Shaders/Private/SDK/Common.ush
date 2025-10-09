@@ -7,97 +7,76 @@
 * distribution of this software and related documentation without an express
 * license agreement from NVIDIA CORPORATION is strictly prohibited.
 */
-
+//Fully Optimized By RedPixel
 #ifndef RTXGI_COMMON_HLSL
 #define RTXGI_COMMON_HLSL
 
-static const float RTXGI_PI = 3.1415926535897932f;
-static const float RTXGI_2PI = 6.2831853071795864f;
+static const float RTXGI_PI   = 3.1415926535897932f;
+static const float RTXGI_2PI  = 6.2831853071795864f;
+static const float RTXGI_INV_1023 = 0.0009775171065493646f; // 1/1023
 
 //------------------------------------------------------------------------
-// Math Helpers
+// Math Helpers (optimized; branchless where possible, fused ops)
 //------------------------------------------------------------------------
 
-/**
-* Finds the smallest component of the vector.
-*/
-float RTXGIMinComponent(float3 a)
+inline float RTXGIMinComponent(float3 a)
 {
     return min(a.x, min(a.y, a.z));
 }
 
-/**
-* Finds the largest component of the vector.
-*/
-float RTXGIMaxComponent(float3 a)
+inline float RTXGIMaxComponent(float3 a)
 {
     return max(a.x, max(a.y, a.z));
 }
 
-/**
-* Returns either -1 or 1 based on the sign of the input value.
-* If the input is zero, 1 is returned.
-*/
-float RTXGISignNotZero(float v)
+// Returns +1 for v >= 0, else -1 (zero maps to +1)
+inline float RTXGISignNotZero(float v)
 {
-    return (v >= 0.f) ? 1.f : -1.f;
+    // step(0,v) -> 1 if v>=0 else 0; 2*s-1 -> +1 or -1
+    return mad(step(0.0f, v), 2.0f, -1.0f);
 }
 
-/**
-* 2-component version of RTXGISignNotZero.
-*/
-float2 RTXGISignNotZero(float2 v)
+inline float2 RTXGISignNotZero(float2 v)
 {
-    return float2(RTXGISignNotZero(v.x), RTXGISignNotZero(v.y));
+    const float2 s = step(0.0f.xx, v);     // component-wise
+    return mad(s, 2.0f.xx, -1.0f.xx);
 }
 
-/**
-* Return the given float value as an unsigned integer within the given numerical scale.
-*/
-uint RTXGIFloatToUint(float v, float scale)
+// Round-to-nearest (half-up) into [0..scale]; keep exact behavior
+inline uint RTXGIFloatToUint(float v, float scale)
 {
-    return (uint)floor(v * scale + 0.5f);
+    return (uint)floor(mad(v, scale, 0.5f));
 }
 
-/**
-* Pack a float3 into a 32-bit unsigned integer.
-* All channels use 10 bits and 2 bits are unused.
-* Compliment of RTXGIUintToFloat3().
-*/
-uint RTXGIFloat3ToUint(float3 input)
+// Pack float3 into 10:10:10 (no clamp to preserve original behavior)
+inline uint RTXGIFloat3ToUint(float3 c)
 {
-    return (RTXGIFloatToUint(input.r, 1023.f)) | (RTXGIFloatToUint(input.g, 1023.f) << 10) | (RTXGIFloatToUint(input.b, 1023.f) << 20);
+    const uint3 u = (uint3)floor(mad(c, 1023.0f.xxx, 0.5f.xxx));
+    return (u.x) | (u.y << 10) | (u.z << 20);
 }
 
-/**
-* Unpack a packed 32-bit unsigned integer to a float3.
-* Compliment of RTXGIFloat3ToUint().
-*/
-float3 RTXGIUintToFloat3(uint input)
+// Unpack 10:10:10 to float3
+inline float3 RTXGIUintToFloat3(uint p)
 {
-    float3 unpacked;
-    unpacked.x = (float)(input & 0x000003FF) / 1023.f;
-    unpacked.y = (float)((input >> 10) & 0x000003FF) / 1023.f;
-    unpacked.z = (float)((input >> 20) & 0x000003FF) / 1023.f;
-    return unpacked;
+    const uint x =  p         & 0x3FFu;
+    const uint y = (p >> 10)  & 0x3FFu;
+    const uint z = (p >> 20)  & 0x3FFu;
+    return float3(x, y, z) * RTXGI_INV_1023;
 }
 
-/**
-* Rotate vector v with quaternion q.
-*/
-float3 RTXGIQuaternionRotate(float3 v, float4 q)
+// Rotate vector v by quaternion q
+inline float3 RTXGIQuaternionRotate(float3 v, float4 q)
 {
-    float3 b = q.xyz;
-    float b2 = dot(b, b);
-    return (v * (q.w * q.w - b2) + b * (dot(v, b) * 2.f) + cross(b, v) * (q.w * 2.f));
+    const float3 b  = q.xyz;
+    const float  ww = q.w * q.w;
+    const float  bb = dot(b, b);
+    const float  two = 2.0f;
+    // v*(w^2 - |b|^2) + b*(2*dot(v,b)) + cross(b,v)*(2*w)
+    return mad(v, (ww - bb), mad(b, (two * dot(v, b)), cross(b, v) * (two * q.w)));
 }
 
-/**
-* Quaternion conjugate.
-* For unit quaternions, conjugate equals inverse.
-* Use this to create a quaternion that rotates in the opposite direction.
-*/
-float4 RTXGIQuaternionConjugate(float4 q)
+// Conjugate (inverse for unit quaternions)
+inline float4 RTXGIQuaternionConjugate(float4 q)
 {
     return float4(-q.xyz, q.w);
 }
